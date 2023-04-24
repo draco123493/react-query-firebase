@@ -26,6 +26,7 @@ import {
   UseQueryOptions,
   UseQueryResult,
 } from "react-query";
+import { useEffect, useMemo } from "react";
 
 type Unsubscribe = AuthUnsubscribe | FirestoreUnsubscribe | DatabaseUnsubscribe;
 
@@ -77,80 +78,104 @@ export function useSubscription<TData, TError, R = TData>(
 ): UseQueryResult<R, TError> {
   const hashFn = options?.queryKeyHashFn || hashQueryKey;
   const subscriptionHash = hashFn(subscriptionKey);
+  const enabled = options?.enabled ?? true;
   const queryClient = useQueryClient();
 
-
-  let resolvePromise: (data: TData | null) => void = () => null;
-  let rejectPromise: (err: any) => void = () => null;
-
-  const result: CancellablePromise<TData | null> = new Promise<TData | null>(
-    (resolve, reject) => {
+  const { result, resolvePromise, rejectPromise } = useMemo(() => {
+    let resolvePromise: (data: TData | null) => void = () => null;
+    let rejectPromise: (err: any) => void = () => null;
+    const result: CancellablePromise<TData | null> = new Promise<TData | null>((resolve, reject) => {
       resolvePromise = resolve;
       rejectPromise = reject;
+    });
+    result.cancel = () => {
+      queryClient.invalidateQueries(queryKey);
+    };
+
+    return {
+      result,
+      resolvePromise,
+      rejectPromise
+    };
+  }, [queryKey.toString()]);
+
+  useEffect(() => {
+    if (!options?.onlyOnce || !enabled) {
+      return;
     }
-  );
-
-  result.cancel = () => {
-    queryClient.invalidateQueries(queryKey);
-  };
-
-  if (options?.onlyOnce) {
     if (!options.fetchFn) {
       throw new Error("You must specify fetchFn if using onlyOnce mode.");
-    } else {
-      const enabled = options?.enabled ?? true;
-      if (enabled) {
-        options
-          .fetchFn()
-          .then(resolvePromise)
-          .catch((err) => {
-            rejectPromise(err);
-          });
-      }
     }
-  } else {
-    const subscribedToQueryCache = !!queryCacheUnsubscribes[subscriptionHash];
-    if (!subscribedToQueryCache) {
-      const queryCache = queryClient.getQueryCache();
-      queryCacheUnsubscribes[subscriptionHash] = queryCache.subscribe((event) => {
-        if (!event || event.query.queryHash !== hashFn(queryKey)) {
+    let cancelled = false;
+    options
+      .fetchFn()
+      .then((data) => {
+        if (cancelled) {
           return;
         }
-        const { query, type } = event;
-        if (type === "queryRemoved") {
-          delete eventCount[subscriptionHash];
+        resolvePromise(data);
+      })
+      .catch((err) => {
+        if (cancelled) {
+          return;
+        }
+        rejectPromise(err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [options?.onlyOnce, !options?.fetchFn, enabled, resolvePromise, rejectPromise]);
+
+  useEffect(() => {
+    if (options?.onlyOnce || !enabled) {
+      return;
+    }
+    const subscribedToQueryCache = !!queryCacheUnsubscribes[subscriptionHash];
+    if (subscribedToQueryCache) {
+      return;
+    }
+    const queryCache = queryClient.getQueryCache();
+    queryCacheUnsubscribes[subscriptionHash] = queryCache.subscribe((event) => {
+      if (!event || event.query.queryHash !== hashFn(queryKey)) {
+        return;
+      }
+      const { query, type } = event;
+      const observersCount = query.getObserversCount();
+      const isSubscribedToFirestore = !!firestoreUnsubscribes[subscriptionHash];
+      switch (type) {
+        case "queryRemoved":
           queryCacheUnsubscribe(subscriptionHash);
           firestoreUnsubscribe(subscriptionHash);
-        }
-        if (type === "observerAdded" || type === "observerRemoved") {
-          const observersCount = query.getObserversCount();
-          if (observersCount === 0) {
-            firestoreUnsubscribe(subscriptionHash);
-          } else {
-            const isSubscribedToFirestore = !!firestoreUnsubscribes[subscriptionHash];
-            if (isSubscribedToFirestore) {
-              const cachedData = queryClient.getQueryData<TData | null>(queryKey);
-              const hasData = !!eventCount[subscriptionHash];
-
-              if (hasData) {
-                resolvePromise(cachedData ?? null);
-              }
-            } else {
-              firestoreUnsubscribes[subscriptionHash] = subscribeFn(async (data) => {
-                eventCount[subscriptionHash] ??= 0;
-                eventCount[subscriptionHash]++;
-                if (eventCount[subscriptionHash] === 1) {
-                  resolvePromise(data || null);
-                } else {
-                  queryClient.setQueryData(queryKey, data);
-                }
-              });
-            }
+          break;
+        case "observerRemoved":
+          if (observersCount !== 0) {
+            return;
           }
-        }
-      });
-    }
-  }
+          firestoreUnsubscribe(subscriptionHash);
+          break;
+        case "observerAdded":
+          if (isSubscribedToFirestore) {
+            const cachedData = queryClient.getQueryData<TData | null>(queryKey);
+            const hasData = !!eventCount[subscriptionHash];
+
+            if (hasData) {
+              resolvePromise(cachedData ?? null);
+            }
+            return;
+          }
+          firestoreUnsubscribes[subscriptionHash] = subscribeFn(async (data) => {
+            eventCount[subscriptionHash] ??= 0;
+            eventCount[subscriptionHash]++;
+            if (eventCount[subscriptionHash] === 1) {
+              resolvePromise(data || null);
+              return;
+            }
+            queryClient.setQueryData(queryKey, data);
+          });
+          break;
+      }
+    });
+  }, [options?.onlyOnce, enabled, subscriptionHash, subscribeFn, queryKey.toString()]);
 
   const queryFn: QueryFunction<TData> = () => {
     return result as Promise<TData>;
